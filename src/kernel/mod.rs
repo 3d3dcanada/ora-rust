@@ -9,6 +9,7 @@ pub mod constitution;
 pub mod memory;
 pub mod tools;
 pub mod validator;
+pub mod web_search;
 
 pub use agent::{
     Agent, AgentResult, ExecutionPlan, ExecutionStatus, ExecutionStep, VerificationResult,
@@ -18,6 +19,7 @@ pub use constitution::Constitution;
 pub use memory::{ContextEntry, OraMemory, UserPreferences};
 pub use tools::{ToolExecutor, ToolResult};
 pub use validator::Validator;
+pub use web_search::WebSearchService;
 
 use crate::error::Result;
 use crate::security::vault::Vault;

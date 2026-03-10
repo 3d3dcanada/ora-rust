@@ -2,7 +2,9 @@
 //!
 //! Tool execution for filesystem, shell, and other operations.
 
+use crate::kernel::web_search::WebSearchService;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 /// Tool execution result
@@ -17,12 +19,16 @@ pub struct ToolResult {
 /// Tool executor
 pub struct ToolExecutor {
     workspace_root: PathBuf,
+    web_search: WebSearchService,
 }
 
 impl ToolExecutor {
     /// Create new tool executor
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self { workspace_root }
+        Self {
+            workspace_root,
+            web_search: WebSearchService::from_env(),
+        }
     }
 
     /// Execute a tool
@@ -50,7 +56,6 @@ impl ToolExecutor {
 
         match path {
             Some(p) => {
-                // Security: only allow files in workspace
                 if !p.starts_with(&self.workspace_root) {
                     return ToolResult {
                         tool_name: "read_file".to_string(),
@@ -94,7 +99,6 @@ impl ToolExecutor {
 
         match (path, content) {
             (Some(p), Some(c)) => {
-                // Security: only allow files in workspace
                 if !p.starts_with(&self.workspace_root) {
                     return ToolResult {
                         tool_name: "write_file".to_string(),
@@ -104,7 +108,6 @@ impl ToolExecutor {
                     };
                 }
 
-                // Create parent directories
                 if let Some(parent) = p.parent() {
                     if let Err(e) = std::fs::create_dir_all(parent) {
                         return ToolResult {
@@ -146,7 +149,6 @@ impl ToolExecutor {
 
         match path {
             Some(p) => {
-                // Security: only allow in workspace
                 if !p.starts_with(&self.workspace_root) && !p.starts_with("/") {
                     return ToolResult {
                         tool_name: "list_directory".to_string(),
@@ -194,7 +196,6 @@ impl ToolExecutor {
 
         match command {
             Some(cmd) => {
-                // Security: Basic command validation
                 let dangerous = ["rm -rf /", "dd if=", "mkfs", ":(){ :|:& };:"];
                 for pattern in dangerous {
                     if cmd.contains(pattern) {
@@ -207,7 +208,6 @@ impl ToolExecutor {
                     }
                 }
 
-                // Execute command
                 match std::process::Command::new("sh")
                     .arg("-c")
                     .arg(cmd)
@@ -245,18 +245,33 @@ impl ToolExecutor {
         }
     }
 
-    /// Web search (placeholder - would use actual API)
+    /// Search the web through the configured provider.
     async fn web_search(&self, args: serde_json::Value) -> ToolResult {
-        let query = args.get("query").and_then(|v| v.as_str());
+        let query = args.get("query").and_then(|v| v.as_str()).map(str::trim);
+        let num_results = args
+            .get("num_results")
+            .and_then(|v| v.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(5);
 
         match query {
-            Some(q) => ToolResult {
-                tool_name: "web_search".to_string(),
-                success: true,
-                output: format!("Web search placeholder for: {}", q),
-                error: None,
-            },
-            None => ToolResult {
+            Some(query) if !query.is_empty() => {
+                match self.web_search.search(query, num_results).await {
+                    Ok(results) => ToolResult {
+                        tool_name: "web_search".to_string(),
+                        success: true,
+                        output: format_search_results(query, &results),
+                        error: None,
+                    },
+                    Err(error) => ToolResult {
+                        tool_name: "web_search".to_string(),
+                        success: false,
+                        output: String::new(),
+                        error: Some(error.to_string()),
+                    },
+                }
+            }
+            _ => ToolResult {
                 tool_name: "web_search".to_string(),
                 success: false,
                 output: String::new(),
@@ -271,17 +286,14 @@ impl ToolExecutor {
 
         match code {
             Some(c) => {
-                // Simple static analysis
                 let mut issues = Vec::new();
-
-                // Check for common issues
                 if c.contains("eval(") {
                     issues.push("Warning: use of eval() is dangerous");
                 }
                 if c.contains("exec(") {
                     issues.push("Warning: use of exec() requires caution");
                 }
-                if c.contains("password") && c.contains("=") {
+                if c.contains("password") && c.contains('=') {
                     issues.push("Warning: potential hardcoded password");
                 }
 
@@ -334,6 +346,29 @@ impl ToolExecutor {
     }
 }
 
+fn format_search_results(
+    query: &str,
+    results: &[crate::kernel::web_search::SearchResult],
+) -> String {
+    if results.is_empty() {
+        return format!("No search results found for '{query}'.");
+    }
+
+    let mut output = String::new();
+    for (index, result) in results.iter().enumerate() {
+        let _ = writeln!(output, "{}. {}", index + 1, result.title);
+        let _ = writeln!(output, "   URL: {}", result.url);
+        if !result.snippet.is_empty() {
+            let _ = writeln!(output, "   Snippet: {}", result.snippet);
+        }
+        let _ = writeln!(output, "   Source: {}", result.source);
+        if index + 1 != results.len() {
+            output.push('\n');
+        }
+    }
+    output.trim_end().to_string()
+}
+
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
@@ -347,11 +382,11 @@ fn memory_info() -> usize {
             .ok()
             .and_then(|s| {
                 s.lines()
-                    .find(|l| l.starts_with("MemAvailable:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|v| v.parse::<usize>().ok())
+                    .find(|line| line.starts_with("MemAvailable:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<usize>().ok())
             })
-            .map(|k| k / 1024)
+            .map(|kilobytes| kilobytes / 1024)
             .unwrap_or(0)
     }
     #[cfg(not(target_os = "linux"))]
@@ -365,13 +400,18 @@ fn disk_info() -> String {
     {
         std::fs::read_to_string("/proc/mounts")
             .ok()
-            .map(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("/ "))
-                    .map(|l| l.split_whitespace().nth(1).unwrap_or("unknown").to_string())
-                    .unwrap_or_default()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find(|line| line.split_whitespace().nth(1) == Some("/"))
+                    .map(|line| {
+                        line.split_whitespace()
+                            .next()
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| "unknown".to_string())
     }
     #[cfg(not(target_os = "linux"))]
     {

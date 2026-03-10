@@ -166,25 +166,5 @@ pub fn get_ora_tools() -> Vec<ToolDefinition> {
                 "required": ["info_type"]
             }),
         ),
-        // Memory/Context
-        ToolDefinition::new(
-            "search_memory",
-            "Search the agent's memory for relevant context",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results",
-                        "default": 5
-                    }
-                },
-                "required": ["query"]
-            }),
-        ),
     ]
 }

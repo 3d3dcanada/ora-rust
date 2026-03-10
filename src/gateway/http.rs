@@ -1,17 +1,17 @@
 //! OrA HTTP Gateway
 //!
-//! REST API routes for OrA
+//! REST API routes for OrA.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::error::OraError;
-use crate::state::AgentEvent;
+use crate::gateway::tasks::spawn_prompt_task;
 use crate::AppState;
 
 #[derive(Debug, Serialize)]
@@ -78,6 +78,11 @@ pub struct ApprovalInfo {
     pub id: String,
     pub agent: String,
     pub operation: String,
+    pub description: String,
+    pub authority_required: String,
+    pub query: String,
+    pub created_at: String,
+    pub status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,12 +150,6 @@ pub fn create_router(config: Config, state: AppState) -> Router {
         .with_state((config, state))
 }
 
-fn ora_system_prompt() -> &'static str {
-    r#"You are OrA, an AI assistant with a security-first mindset.
-You help users with tasks while being aware of security implications.
-Be concise and helpful. If a request seems dangerous, warn the user."#
-}
-
 fn permissions_for_level(level: u8) -> Vec<String> {
     let mut permissions = vec!["read".to_string()];
     if level >= 1 {
@@ -169,31 +168,6 @@ fn permissions_for_level(level: u8) -> Vec<String> {
         permissions.push("kernel".to_string());
     }
     permissions
-}
-
-async fn generate_chat_response(state: &AppState, command: &str) -> Result<String, OraError> {
-    if !state.llm.is_configured() {
-        return Err(OraError::CredentialNotFound {
-            provider: state.config.llm_provider.clone(),
-        });
-    }
-
-    state.llm.chat(ora_system_prompt(), command).await
-}
-
-fn map_chat_error(error: OraError) -> String {
-    match error {
-        OraError::CredentialNotFound { provider } => {
-            format!(
-                "LLM provider '{}' is not configured. Set credentials or switch providers.",
-                provider
-            )
-        }
-        OraError::ModelNotAvailable { model } => {
-            format!("Configured model is not available: {}", model)
-        }
-        other => format!("Error: {}", other),
-    }
 }
 
 async fn root() -> Json<serde_json::Value> {
@@ -315,34 +289,99 @@ async fn authority_escalate(
     })
 }
 
-async fn approvals_list() -> Json<ApprovalsResponse> {
-    Json(ApprovalsResponse { approvals: vec![] })
+async fn approvals_list(State((_, state)): State<(Config, AppState)>) -> Json<ApprovalsResponse> {
+    Json(ApprovalsResponse {
+        approvals: state
+            .pending_approvals()
+            .into_iter()
+            .map(|approval| ApprovalInfo {
+                id: approval.id,
+                agent: approval.agent,
+                operation: approval.operation,
+                description: approval.description,
+                authority_required: approval.authority_required,
+                query: approval.query,
+                created_at: approval.created_at,
+                status: "pending".to_string(),
+            })
+            .collect(),
+    })
 }
 
 async fn approval_approve(
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(_req): Json<ApprovalActionRequest>,
-) -> Json<ApprovalActionResponse> {
-    Json(ApprovalActionResponse {
-        success: true,
-        message: format!("Approval {} approved", id),
-    })
+    Path(id): Path<String>,
+    State((_, state)): State<(Config, AppState)>,
+    Json(req): Json<ApprovalActionRequest>,
+) -> (StatusCode, Json<ApprovalActionResponse>) {
+    let known = state
+        .pending_approvals()
+        .into_iter()
+        .any(|approval| approval.id == id);
+    if !known {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApprovalActionResponse {
+                success: false,
+                message: format!("Approval {} not found", id),
+            }),
+        );
+    }
+
+    state.broadcast(crate::state::AgentEvent::ApprovalResolved {
+        approval_id: id.clone(),
+        approved: true,
+        approver: req.approver,
+        reason: req.reason,
+    });
+
+    (
+        StatusCode::OK,
+        Json(ApprovalActionResponse {
+            success: true,
+            message: format!("Approval {} approved", id),
+        }),
+    )
 }
 
 async fn approval_reject(
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(_req): Json<ApprovalActionRequest>,
-) -> Json<ApprovalActionResponse> {
-    Json(ApprovalActionResponse {
-        success: true,
-        message: format!("Approval {} rejected", id),
-    })
+    Path(id): Path<String>,
+    State((_, state)): State<(Config, AppState)>,
+    Json(req): Json<ApprovalActionRequest>,
+) -> (StatusCode, Json<ApprovalActionResponse>) {
+    let known = state
+        .pending_approvals()
+        .into_iter()
+        .any(|approval| approval.id == id);
+    if !known {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApprovalActionResponse {
+                success: false,
+                message: format!("Approval {} not found", id),
+            }),
+        );
+    }
+
+    state.broadcast(crate::state::AgentEvent::ApprovalResolved {
+        approval_id: id.clone(),
+        approved: false,
+        approver: req.approver,
+        reason: req.reason,
+    });
+
+    (
+        StatusCode::OK,
+        Json(ApprovalActionResponse {
+            success: true,
+            message: format!("Approval {} rejected", id),
+        }),
+    )
 }
 
 async fn kernel_metrics() -> Json<MetricsResponse> {
     Json(MetricsResponse {
-        cpu_usage: 0.0,
-        memory_usage: 0.0,
+        cpu_usage: current_cpu_usage(),
+        memory_usage: current_memory_usage(),
     })
 }
 
@@ -354,48 +393,34 @@ async fn kernel_process(
         .session_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let command = req.command.clone();
-
-    let gate_result = state.security_gates.parse_prompt(&command);
-
-    let response = if !gate_result.passed {
-        let reason = gate_result.reason.clone().unwrap_or_default();
-        state.broadcast(AgentEvent::Error {
-            task_id: Some(task_id.clone()),
-            message: format!("Security blocked: {}", reason),
-        });
-        format!("Security blocked: {}", reason)
+    let command = if req.command.trim().is_empty() {
+        req.message
     } else {
-        state.broadcast(AgentEvent::TaskStarted {
-            task_id: task_id.clone(),
-            task: command.clone(),
-        });
-
-        match generate_chat_response(&state, &command).await {
-            Ok(output) => {
-                state.broadcast(AgentEvent::TaskCompleted {
-                    task_id: task_id.clone(),
-                    success: true,
-                    summary: output.clone(),
-                });
-                output
-            }
-            Err(error) => {
-                let message = map_chat_error(error);
-                state.broadcast(AgentEvent::Error {
-                    task_id: Some(task_id.clone()),
-                    message: message.clone(),
-                });
-                message
-            }
-        }
+        req.command
     };
 
-    Json(ChatResponse {
-        response,
-        session_id: task_id,
-        requires_approval: false,
-    })
+    let handle = spawn_prompt_task(state.clone(), task_id.clone(), command);
+
+    match handle.await {
+        Ok(result) => Json(ChatResponse {
+            response: result.response,
+            session_id: result.task_id,
+            requires_approval: result.requires_approval,
+        }),
+        Err(error) if error.is_cancelled() => Json(ChatResponse {
+            response: state
+                .task(&task_id)
+                .and_then(|task| task.summary)
+                .unwrap_or_else(|| "Task cancelled by client".to_string()),
+            session_id: task_id,
+            requires_approval: false,
+        }),
+        Err(error) => Json(ChatResponse {
+            response: format!("Task execution failed: {}", error),
+            session_id: task_id,
+            requires_approval: false,
+        }),
+    }
 }
 
 async fn chat_handler(
@@ -411,4 +436,61 @@ async fn chat_handler(
         }),
     )
     .await
+}
+
+fn current_cpu_usage() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        let load = std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let cpus = std::thread::available_parallelism()
+            .map(|count| count.get() as f64)
+            .unwrap_or(1.0);
+        ((load / cpus) * 100.0).clamp(0.0, 100.0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0.0
+    }
+}
+
+fn current_memory_usage() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = match std::fs::read_to_string("/proc/meminfo") {
+            Ok(contents) => contents,
+            Err(_) => return 0.0,
+        };
+
+        let mut total_kb = None;
+        let mut available_kb = None;
+
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                total_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse::<f64>().ok());
+            }
+            if line.starts_with("MemAvailable:") {
+                available_kb = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|value| value.parse::<f64>().ok());
+            }
+        }
+
+        match (total_kb, available_kb) {
+            (Some(total), Some(available)) if total > 0.0 => {
+                ((1.0 - (available / total)) * 100.0).clamp(0.0, 100.0)
+            }
+            _ => 0.0,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0.0
+    }
 }

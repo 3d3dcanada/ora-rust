@@ -10,7 +10,9 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
+use crate::gateway::tasks::spawn_prompt_task;
 use crate::state::{AgentEvent, AppState};
 
 /// WebSocket message from client
@@ -83,7 +85,10 @@ pub enum WsResponse {
         steps_executed: u32,
     },
 
-    /// Chat response (simplified)
+    /// Task cancelled event
+    TaskCancelled { task_id: String, reason: String },
+
+    /// Chat response acknowledgement
     ChatResponse {
         message: String,
         task_id: Option<String>,
@@ -159,40 +164,49 @@ pub async fn websocket_handler(
 /// Handle WebSocket connection
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<WsResponse>();
 
-    // Send connected message
     let connected = WsResponse::Connected {
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    let _ = sender
-        .send(Message::Text(
-            serde_json::to_string(&connected).unwrap_or_default(),
-        ))
-        .await;
+    let _ = outgoing_tx.send(connected);
 
-    // Subscribe to agent events
-    let mut event_rx = state.subscribe();
+    let writer = tokio::spawn(async move {
+        while let Some(response) = outgoing_rx.recv().await {
+            let json = match serde_json::to_string(&response) {
+                Ok(json) => json,
+                Err(_) => continue,
+            };
 
-    // Clone state for the event loop
-    let state_clone = state.clone();
-
-    // Spawn task to forward events to client
-    let send_task = tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            let response = event_to_response(&event);
-            let json = serde_json::to_string(&response).unwrap_or_default();
             if sender.send(Message::Text(json)).await.is_err() {
                 break;
             }
         }
     });
 
-    // Handle incoming messages
+    let mut event_rx = state.subscribe();
+    let event_tx = outgoing_tx.clone();
+    let event_forwarder = tokio::spawn(async move {
+        while let Ok(event) = event_rx.recv().await {
+            if event_tx.send(event_to_response(&event)).is_err() {
+                break;
+            }
+        }
+    });
+
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                    handle_message(ws_msg, &state_clone).await;
+                let response = match serde_json::from_str::<WsMessage>(&text) {
+                    Ok(ws_msg) => handle_message(ws_msg, &state).await,
+                    Err(error) => WsResponse::Error {
+                        task_id: None,
+                        message: format!("Invalid WebSocket payload: {}", error),
+                    },
+                };
+
+                if outgoing_tx.send(response).is_err() {
+                    break;
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -201,82 +215,106 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Clean up
-    send_task.abort();
+    event_forwarder.abort();
+    drop(outgoing_tx);
+    writer.abort();
 }
 
-/// Handle incoming message
-async fn handle_message(msg: WsMessage, state: &AppState) {
+/// Handle incoming message and return an immediate protocol response.
+async fn handle_message(msg: WsMessage, state: &AppState) -> WsResponse {
     match msg {
-        WsMessage::Ping { timestamp } => {
-            // Pong is handled by the event forwarder
-            let pong = WsResponse::Pong { timestamp };
-            state.broadcast(AgentEvent::Error {
-                task_id: None,
-                message: serde_json::to_string(&pong).unwrap_or_default(),
-            });
-        }
-
+        WsMessage::Ping { timestamp } => WsResponse::Pong { timestamp },
         WsMessage::Chat {
             message,
             session_id,
         } => {
-            // The actual processing is done via HTTP endpoint
-            // This just acknowledges receipt
-            let _ = state.event_tx.send(AgentEvent::TaskStarted {
-                task_id: session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                task: message,
-            });
-        }
-
-        WsMessage::Cancel { task_id } => {
-            // TODO: Implement task cancellation
-            let _ = state.event_tx.send(AgentEvent::Error {
+            let task_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            std::mem::drop(spawn_prompt_task(state.clone(), task_id.clone(), message));
+            WsResponse::ChatResponse {
+                message: "Task accepted".to_string(),
                 task_id: Some(task_id),
-                message: "Task cancelled".to_string(),
-            });
+                status: "running".to_string(),
+            }
         }
-
-        WsMessage::GetPending => {
-            // Return empty pending list (would query approval system)
+        WsMessage::Cancel { task_id } => {
+            if state.cancel_task(&task_id, None) {
+                WsResponse::TaskCancelled {
+                    task_id,
+                    reason: "Task cancelled by client".to_string(),
+                }
+            } else {
+                WsResponse::Error {
+                    task_id: Some(task_id),
+                    message: "Task is not running or was not found".to_string(),
+                }
+            }
         }
-
+        WsMessage::GetPending => WsResponse::PendingApprovals {
+            approvals: state
+                .pending_approvals()
+                .into_iter()
+                .map(|approval| PendingApproval {
+                    id: approval.id,
+                    agent: approval.agent,
+                    operation: approval.operation,
+                    description: approval.description,
+                    authority_required: approval.authority_required,
+                    query: approval.query,
+                    created_at: approval.created_at,
+                })
+                .collect(),
+        },
         WsMessage::ApprovalResponse {
             id,
             approved,
             reason,
         } => {
-            // Handle approval response
-            let _ = state.event_tx.send(AgentEvent::ApprovalRequired {
-                approval_id: id,
-                operation: if approved { "approved" } else { "rejected" }.to_string(),
-                description: reason.unwrap_or_default(),
+            let known = state
+                .pending_approvals()
+                .into_iter()
+                .any(|approval| approval.id == id);
+            if !known {
+                return WsResponse::Error {
+                    task_id: None,
+                    message: format!("Approval {} not found", id),
+                };
+            }
+
+            state.broadcast(AgentEvent::ApprovalResolved {
+                approval_id: id.clone(),
+                approved,
+                approver: Some("websocket-client".to_string()),
+                reason: reason.clone(),
             });
+
+            WsResponse::ApprovalResult {
+                approval_id: id,
+                approved,
+                reason,
+            }
         }
     }
 }
 
-/// Convert AgentEvent to WsResponse
+/// Convert AgentEvent to WsResponse.
 fn event_to_response(event: &AgentEvent) -> WsResponse {
     match event {
         AgentEvent::TaskStarted { task_id, task } => WsResponse::TaskStarted {
             task_id: task_id.clone(),
             task: task.clone(),
         },
-
         AgentEvent::PlanCreated { task_id, steps } => WsResponse::PlanCreated {
             task_id: task_id.clone(),
             steps: steps
                 .iter()
                 .enumerate()
-                .map(|(i, s)| PlanStepInfo {
+                .map(|(i, step)| PlanStepInfo {
                     step_number: i as u32 + 1,
-                    tool: s.clone(), // Simplified
-                    description: s.clone(),
+                    tool: step.clone(),
+                    description: step.clone(),
                 })
                 .collect(),
         },
-
         AgentEvent::StepStarted {
             task_id,
             step_number,
@@ -288,7 +326,6 @@ fn event_to_response(event: &AgentEvent) -> WsResponse {
             tool: tool.clone(),
             description: description.clone(),
         },
-
         AgentEvent::StepCompleted {
             task_id,
             step_number,
@@ -300,7 +337,6 @@ fn event_to_response(event: &AgentEvent) -> WsResponse {
             success: *success,
             output: output.clone(),
         },
-
         AgentEvent::TaskCompleted {
             task_id,
             success,
@@ -309,22 +345,37 @@ fn event_to_response(event: &AgentEvent) -> WsResponse {
             task_id: task_id.clone(),
             success: *success,
             summary: summary.clone(),
-            steps_executed: 0, // Would be filled from actual result
+            steps_executed: 1,
         },
-
+        AgentEvent::TaskCancelled { task_id, reason } => WsResponse::TaskCancelled {
+            task_id: task_id.clone(),
+            reason: reason.clone(),
+        },
         AgentEvent::ApprovalRequired {
             approval_id,
+            agent,
             operation,
             description,
+            authority_required,
+            query,
         } => WsResponse::ApprovalRequest(ApprovalRequest {
             id: approval_id.clone(),
-            agent: "OrA".to_string(),
+            agent: agent.clone(),
             operation: operation.clone(),
             description: description.clone(),
-            authority_required: "A3".to_string(),
-            query: description.clone(),
+            authority_required: authority_required.clone(),
+            query: query.clone(),
         }),
-
+        AgentEvent::ApprovalResolved {
+            approval_id,
+            approved,
+            reason,
+            ..
+        } => WsResponse::ApprovalResult {
+            approval_id: approval_id.clone(),
+            approved: *approved,
+            reason: reason.clone(),
+        },
         AgentEvent::Error { task_id, message } => WsResponse::Error {
             task_id: task_id.clone(),
             message: message.clone(),

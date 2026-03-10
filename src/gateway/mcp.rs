@@ -159,6 +159,18 @@ impl McpServer {
                     "required": ["command"]
                 }
             }),
+            serde_json::json!({
+                "name": "web_search",
+                "description": "Searches the web through the configured provider.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "num_results": { "type": "integer", "default": 5 }
+                    },
+                    "required": ["query"]
+                }
+            }),
         ];
 
         Ok(serde_json::json!({

@@ -4,13 +4,21 @@ Security-first AI orchestration backend built with Rust and Axum.
 
 ## Quick Start
 
-### Default local mode
-The default configuration now targets a local Ollama instance at `http://localhost:11434` and auto-selects an installed model, preferring `qwen2.5-coder` when available.
+### HTTP + WebSocket server
+The default configuration targets a local Ollama instance at `http://localhost:11434` and auto-selects an installed model, preferring a coder model when available.
 
 ```bash
-cargo build
-cargo run
+cargo run -- serve
 # Server on http://localhost:8001
+```
+
+Running `cargo run` with no subcommand still starts the HTTP server. Use `cargo run -- --help` to inspect all modes.
+
+### MCP stdio mode
+Run OrA as an MCP server for desktop and IDE integrations.
+
+```bash
+cargo run -- mcp
 ```
 
 ### Optional configuration
@@ -29,6 +37,10 @@ Useful environment variables:
 - `ORA_API_BASE_URL`
 - `ORA_LLM_BASE_URL`
 - `ORA_API_KEY`
+- `BRAVE_SEARCH_API_KEY`
+- `ORA_WEB_SEARCH_BASE_URL`
+
+If `BRAVE_SEARCH_API_KEY` is set, the `web_search` tool uses Brave Search. Otherwise it falls back to live DuckDuckGo search results.
 
 ## Project Structure
 ```text
@@ -57,19 +69,21 @@ ora-rust/
 - `GET /security/status` - Security gate status
 - `GET /authority/current` - Effective authority level
 - `POST /authority/escalate` - Simulated authority escalation response
+- `GET /approvals` - Pending approvals
+- `POST /approvals/:id/approve` - Approve a pending request
+- `POST /approvals/:id/reject` - Reject a pending request
+- `GET /kernel/metrics` - Runtime CPU and memory usage snapshot
 - `POST /kernel/process` - Main prompt-processing entry point
 - `POST /chat` - Chat endpoint
-- `GET /ws` - WebSocket event stream
+- `GET /ws` - WebSocket event stream with task lifecycle and approval updates
 
 ## Current Status
-- `cargo test` passes.
-- `cargo build --release` produces `target/release/ora`.
-- `/chat` works against the default local Ollama setup.
-- `/router/models` is backed by live Ollama model discovery.
-- `build.sh` and `run.sh` are executable.
+- `cargo fmt`, `cargo test`, and `cargo build --release` are expected release gates.
+- `/chat` and `/kernel/process` share the same execution path and emit lifecycle events.
+- WebSocket task cancellation is implemented through the shared task registry.
+- Approval list and approval actions are backed by runtime state instead of placeholder responses.
+- The `web_search` tool now uses a real provider path.
 
-## Known Remaining Work
-- `src/kernel/tools.rs` still contains a placeholder `web_search` implementation.
-- WebSocket task cancellation is still unimplemented.
-- Several non-critical compiler warnings remain in older modules.
-- MCP desktop/client validation still needs a manual end-to-end pass.
+## Remaining External Validation
+- Run a full Claude Desktop or MCP Inspector end-to-end session against the built binary.
+- Decide whether to keep `0.1.0` as the first public tag or bump before release.

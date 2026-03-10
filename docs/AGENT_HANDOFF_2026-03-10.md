@@ -1,44 +1,49 @@
 # Ora-Rust Agent Handoff (2026-03-10)
 
-## Completed 100%
-- [x] Restored release-gate health: `cargo fmt`, `cargo test`, and `cargo build --release` all pass.
-- [x] Replaced the hardcoded `/chat` runtime path with configuration-driven `LlmClient` usage.
-- [x] Switched default local runtime to Ollama with `model = "auto"` and local base URL defaults.
-- [x] Added live local model discovery for `/router/models`.
-- [x] Added installed-model auto-selection with coder-model preference.
-- [x] Fixed the failing AST parser latency test by moving it to a steady-state benchmark.
-- [x] Added `.gitignore` for build artifacts and local secrets.
-- [x] Made `build.sh` and `run.sh` executable.
-- [x] Updated the README to match current runtime behavior.
+## Completed
+- [x] Release gates pass: `cargo fmt --check`, `cargo test`, and `cargo build --release`.
+- [x] `/chat` and `/kernel/process` now share a single task execution path.
+- [x] WebSocket task cancellation is implemented through a shared task registry.
+- [x] Approval list and approval actions are backed by runtime approval state.
+- [x] `web_search` uses a real provider path with provider-specific normalization.
+- [x] MCP now advertises `web_search` in `tools/list`.
+- [x] Added CLI help with explicit `serve` and `mcp` runtime modes.
+- [x] Cleared the remaining dead-code warning in `src/kernel/agent.rs`.
+- [x] Updated the README to reflect the current runtime surface.
 
 ## Verified Runtime State
-- `/chat` returns a valid response from the local model.
-- `/router/models` returns the installed Ollama catalog and marks the selected model.
-- `/config` reports `llm_provider = "ollama"` and `default_model = "auto"` by default.
-- Release binary path: `target/release/ora`
+- `cargo run -- --help` prints explicit `serve` and `mcp` modes.
+- `printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' | cargo run --quiet -- mcp` succeeds.
+- `printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | cargo run --quiet -- mcp` includes `web_search`.
+- `printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"Rust programming language","num_results":2}}}\n' | cargo run --quiet -- mcp` returns live results.
+- `curl -sS http://127.0.0.1:8001/health` returns `{"status":"ok","version":"0.1.0"}`.
+- `curl -sS http://127.0.0.1:8001/kernel/metrics` returns live CPU and memory usage.
+- `curl -sS http://127.0.0.1:8001/approvals` returns a real approval-state payload.
+- `printf '{"message":"Reply with exactly OK."}' | curl --max-time 10 -sS -X POST http://127.0.0.1:8001/chat -H 'content-type: application/json' -d @-` returns `OK`.
+- Release binary path: `target/release/ora`.
 
-## Remaining Work
-- [ ] Initialize Git in this directory if it has not been done yet in the current session.
-- [ ] Create or attach the GitHub remote and push `main`.
-- [ ] Decide whether to keep `0.1.0` as the initial public version or bump before tagging.
-- [ ] Replace the placeholder `web_search` tool implementation.
-- [ ] Implement WebSocket task cancellation.
-- [ ] Run a manual Claude Desktop or MCP Inspector end-to-end test.
-- [ ] Continue compiler warning cleanup in legacy modules.
-- [ ] Add real CLI help and explicit mode descriptions.
+## Current Repo/Release Notes
+- Git is initialized and `origin` is already configured for `main`.
+- The repository version remains `0.1.0`.
+- Search uses Brave when `BRAVE_SEARCH_API_KEY` is configured and falls back to DuckDuckGo otherwise.
+
+## Remaining External Work
+- [ ] Run a manual Claude Desktop or MCP Inspector end-to-end session.
+- [ ] Decide whether to keep `0.1.0` as the first public tag or bump before release.
+- [ ] Push/tag/release only when you are ready to publish.
 
 ## Recommended Next Order
-1. Confirm Git is initialized and the remote push succeeded.
-2. Run one MCP smoke test against `target/release/ora --mcp-mode`.
-3. Replace `web_search` placeholder and wire a real provider.
-4. Finish WebSocket cancellation and approval-state flows.
-5. Clean the remaining compiler warnings and consider a version/tag decision.
+1. Run one manual desktop/IDE MCP session against `target/release/ora mcp`.
+2. Decide on the public version tag.
+3. Create the release/tag once the manual validation is complete.
 
 ## Validation Commands
 ```bash
 cargo fmt --check
 cargo test
 cargo build --release
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' | target/release/ora --mcp-mode
-printf '{"message":"Reply with exactly OK."}' | curl -sS -X POST http://127.0.0.1:8001/chat -H 'content-type: application/json' -d @-
+cargo run -- --help
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n' | cargo run --quiet -- mcp
+printf '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n' | cargo run --quiet -- mcp
+printf '{"message":"Reply with exactly OK."}' | curl --max-time 10 -sS -X POST http://127.0.0.1:8001/chat -H 'content-type: application/json' -d @-
 ```

@@ -180,7 +180,7 @@ pub struct AgentResult {
 /// The main OrA Agent
 pub struct Agent {
     /// Kernel (authority, constitution, validation)
-    kernel: Arc<RwLock<Kernel>>,
+    _kernel: Arc<RwLock<Kernel>>,
     /// Tool executor
     tools: Arc<ToolExecutor>,
     /// Security gates
@@ -192,7 +192,7 @@ pub struct Agent {
     /// Memory
     memory: Arc<RwLock<OraMemory>>,
     /// Workspace root
-    workspace: PathBuf,
+    _workspace: PathBuf,
     /// Auto-approve dangerous operations
     auto_approve: bool,
 }
@@ -210,13 +210,13 @@ impl Agent {
         let memory = Arc::new(RwLock::new(OraMemory::new_default()));
 
         Self {
-            kernel,
+            _kernel: kernel,
             tools: Arc::new(tools),
             gates,
             audit,
             llm,
             memory,
-            workspace,
+            _workspace: workspace,
             auto_approve: false,
         }
     }
