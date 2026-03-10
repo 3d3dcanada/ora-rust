@@ -1,0 +1,389 @@
+//! OrA Configuration
+//!
+//! Centralized configuration management with environment variable support.
+//! Uses sensible defaults with override capability.
+
+use crate::error::{OraError, Result};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Main configuration for OrA
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    // =========================================================================
+    // Server Configuration
+    // =========================================================================
+    /// Server host (default: 0.0.0.0)
+    pub host: String,
+
+    /// HTTP server port (default: 8001)
+    pub port: u16,
+
+    /// WebSocket port (default: 8001, same as HTTP)
+    pub ws_port: u16,
+
+    // =========================================================================
+    // Paths
+    // =========================================================================
+    /// Workspace root directory (default: ~/.ora-workspace)
+    pub workspace_root: PathBuf,
+
+    /// Vault file path (default: ~/.ora/vault.enc)
+    pub vault_path: PathBuf,
+
+    /// Audit log path (default: ~/.ora/audit.log)
+    pub audit_path: PathBuf,
+
+    /// Config file path (default: ~/.ora/config.toml)
+    pub config_path: Option<PathBuf>,
+
+    // =========================================================================
+    // LLM Configuration
+    // =========================================================================
+    /// Default LLM provider (openai, anthropic, minimax, etc.)
+    pub llm_provider: String,
+
+    /// Default model name (claude-opus-4-6, minimax-m2.5, etc.)
+    pub default_model: String,
+
+    /// Alias for default_model (used by state.rs)
+    #[serde(default)]
+    pub llm_model: Option<String>,
+
+    /// API key (can also come from environment)
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+
+    /// Base URL for API (can be overridden per provider)
+    pub api_base_url: Option<String>,
+
+    /// Alias for api_base_url (used by state.rs)
+    #[serde(default)]
+    pub llm_base_url: Option<String>,
+
+    /// Maximum tokens in response
+    pub max_tokens: u32,
+
+    /// Temperature for generation (0.0 - 2.0)
+    pub temperature: f32,
+
+    // =========================================================================
+    // Security Configuration
+    // =========================================================================
+    /// Maximum authority level without escalation (0-5)
+    pub max_authority_level: u8,
+
+    /// Session timeout in seconds (default: 3600)
+    pub session_timeout: u64,
+
+    /// Enable security gates (default: true)
+    pub security_gates_enabled: bool,
+
+    // =========================================================================
+    // Constitution Configuration
+    // =========================================================================
+    /// Constitution version
+    pub constitution_version: String,
+
+    /// Enable constitution enforcement (default: true)
+    pub constitution_enabled: bool,
+
+    // =========================================================================
+    // User Configuration
+    // =========================================================================
+    /// Default user name
+    pub user_name: String,
+
+    // =========================================================================
+    // Feature Flags
+    // =========================================================================
+    /// Enable debug logging
+    pub debug: bool,
+
+    /// Enable verbose error messages
+    pub verbose_errors: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+
+        Self {
+            // Server
+            host: "0.0.0.0".to_string(),
+            port: 8001,
+            ws_port: 8001,
+
+            // Paths
+            workspace_root: home.join("ora-workspace"),
+            vault_path: home.join(".ora").join("vault.enc"),
+            audit_path: home.join(".ora").join("audit.log"),
+            config_path: Some(home.join(".ora").join("config.toml")),
+
+            // LLM
+            llm_provider: "ollama".to_string(),
+            default_model: "auto".to_string(),
+            llm_model: None,
+            llm_api_key: None,
+            api_base_url: Some("http://localhost:11434".to_string()),
+            llm_base_url: None,
+            max_tokens: 1024,
+            temperature: 0.7,
+
+            // Security
+            max_authority_level: 3, // A3 by default
+            session_timeout: 3600,
+            security_gates_enabled: true,
+
+            // Constitution
+            constitution_version: "1.0.0".to_string(),
+            constitution_enabled: true,
+
+            // User
+            user_name: "User".to_string(),
+
+            // Features
+            debug: false,
+            verbose_errors: false,
+        }
+    }
+}
+
+impl Config {
+    /// Load configuration from file and environment
+    pub fn load() -> Result<Self> {
+        let mut config = Self::default();
+
+        // Try to load from config file
+        if let Some(ref path) = config.config_path {
+            if path.exists() {
+                let contents =
+                    std::fs::read_to_string(path).map_err(|e| OraError::FileSystemError {
+                        path: path.to_string_lossy().to_string(),
+                        message: e.to_string(),
+                    })?;
+
+                let file_config: FileConfig =
+                    toml::from_str(&contents).map_err(|e| OraError::ConfigError {
+                        field: "file".to_string(),
+                        message: e.to_string(),
+                    })?;
+
+                config.apply_file_config(file_config);
+            }
+        }
+
+        // Override with environment variables
+        config.apply_env_vars();
+
+        // Ensure directories exist
+        config.ensure_directories()?;
+
+        Ok(config)
+    }
+
+    /// Load from a specific config file path
+    pub fn load_from(path: &PathBuf) -> Result<Self> {
+        let mut config = Self::default();
+
+        if path.exists() {
+            let contents = std::fs::read_to_string(path)?;
+            let file_config: FileConfig = toml::from_str(&contents)?;
+            config.apply_file_config(file_config);
+        }
+
+        config.apply_env_vars();
+        config.ensure_directories()?;
+
+        Ok(config)
+    }
+
+    /// Apply configuration from file
+    fn apply_file_config(&mut self, config: FileConfig) {
+        if let Some(server) = config.server {
+            self.host = server.host.unwrap_or(self.host.clone());
+            self.port = server.port.unwrap_or(self.port);
+            self.ws_port = server.ws_port.unwrap_or(self.ws_port);
+        }
+
+        if let Some(llm) = config.llm {
+            self.llm_provider = llm.provider.unwrap_or(self.llm_provider.clone());
+            self.default_model = llm.model.unwrap_or(self.default_model.clone());
+            if let Some(api_base_url) = llm.api_base_url {
+                self.api_base_url = Some(api_base_url.clone());
+                self.llm_base_url = Some(api_base_url);
+            }
+            self.max_tokens = llm.max_tokens.unwrap_or(self.max_tokens);
+            self.temperature = llm.temperature.unwrap_or(self.temperature);
+        }
+
+        if let Some(security) = config.security {
+            self.max_authority_level = security
+                .max_authority_level
+                .unwrap_or(self.max_authority_level);
+            self.session_timeout = security.session_timeout.unwrap_or(self.session_timeout);
+            self.security_gates_enabled = security
+                .security_gates_enabled
+                .unwrap_or(self.security_gates_enabled);
+        }
+
+        if let Some(user) = config.user {
+            self.user_name = user.name.unwrap_or(self.user_name.clone());
+        }
+
+        if let Some(debug) = config.debug {
+            self.debug = debug;
+        }
+    }
+
+    /// Apply environment variable overrides
+    fn apply_env_vars(&mut self) {
+        // Server
+        if let Ok(host) = std::env::var("ORA_HOST") {
+            self.host = host;
+        }
+        if let Ok(port) = std::env::var("ORA_PORT") {
+            if let Ok(p) = port.parse() {
+                self.port = p;
+            }
+        }
+
+        // LLM
+        if let Ok(provider) = std::env::var("ORA_LLM_PROVIDER") {
+            self.llm_provider = provider;
+        }
+        if let Ok(model) = std::env::var("ORA_MODEL") {
+            self.default_model = model;
+        }
+        if let Ok(api_key) = std::env::var("ORA_API_KEY") {
+            // API key goes to vault, not config
+            std::env::set_var("ORA_API_KEY", api_key);
+        }
+        if let Ok(base_url) = std::env::var("ORA_API_BASE_URL") {
+            self.api_base_url = Some(base_url.clone());
+            self.llm_base_url = Some(base_url);
+        }
+        if let Ok(base_url) = std::env::var("ORA_LLM_BASE_URL") {
+            self.llm_base_url = Some(base_url);
+        }
+
+        // Security
+        if let Ok(level) = std::env::var("ORA_MAX_AUTHORITY") {
+            if let Ok(l) = level.parse() {
+                self.max_authority_level = l;
+            }
+        }
+
+        // Debug
+        if let Ok(debug) = std::env::var("ORA_DEBUG") {
+            self.debug = debug.to_lowercase() == "true";
+        }
+    }
+
+    /// Ensure required directories exist
+    fn ensure_directories(&self) -> Result<()> {
+        // Ensure .ora directory exists
+        if let Some(parent) = self.vault_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Ensure workspace directory exists
+        std::fs::create_dir_all(&self.workspace_root)?;
+
+        Ok(())
+    }
+
+    /// Get the API base URL for the configured provider
+    pub fn get_api_base_url(&self) -> String {
+        if let Some(ref url) = self.api_base_url {
+            return url.clone();
+        }
+
+        match self.llm_provider.as_str() {
+            "openai" => "https://api.openai.com/v1".to_string(),
+            "anthropic" => "https://api.anthropic.com".to_string(),
+            "minimax" => "https://api.minimax.chat/v1".to_string(),
+            "deepseek" => "https://api.deepseek.com/v1".to_string(),
+            "glm" => "https://open.bigmodel.cn/api/paas/v4".to_string(),
+            "ollama" | "local" => "http://localhost:11434".to_string(),
+            _ => "https://api.openai.com/v1".to_string(),
+        }
+    }
+}
+
+// =========================================================================
+// File Configuration Structures (for TOML parsing)
+// =========================================================================
+
+#[derive(Debug, Deserialize, Default)]
+struct FileConfig {
+    #[serde(default)]
+    server: Option<ServerConfig>,
+    #[serde(default)]
+    llm: Option<LlmConfig>,
+    #[serde(default)]
+    security: Option<SecurityConfig>,
+    #[serde(default)]
+    user: Option<UserConfig>,
+    #[serde(default)]
+    debug: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerConfig {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    ws_port: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmConfig {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_base_url: Option<String>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecurityConfig {
+    #[serde(default)]
+    max_authority_level: Option<u8>,
+    #[serde(default)]
+    session_timeout: Option<u64>,
+    #[serde(default)]
+    security_gates_enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserConfig {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+// =========================================================================
+// Helper for getting home directory
+// =========================================================================
+
+mod dirs {
+    use std::path::PathBuf;
+
+    pub fn home_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var("USERPROFILE").ok().map(PathBuf::from)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::env::var("HOME").ok().map(PathBuf::from)
+        }
+    }
+}
