@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod authority;
 pub mod constitution;
+pub mod control_plane;
 pub mod memory;
 pub mod tools;
 pub mod validator;
@@ -16,6 +17,12 @@ pub use agent::{
 };
 pub use authority::{AuthorityKernel, AuthorityLevel, Session};
 pub use constitution::Constitution;
+pub use control_plane::{
+    content_hash, make_id, workspace_uri, ApprovalRequest, ApprovalState, AuditEvent, BrowserApprovalPolicy,
+    BrowserAuthPolicy, BrowserTask, BrowserTaskStatus, ControlPlane, EvidenceBurden, EvidenceItem,
+    EvidenceSourceType, FreshnessRequirement, MemoryRecord, MissionSpec, RiskClass, RouteClass,
+    RouteDecision, SharedControlPlane, TaskClass, VerifiedAnswerArtifact,
+};
 pub use memory::{ContextEntry, OraMemory, UserPreferences};
 pub use tools::{ToolExecutor, ToolResult};
 pub use validator::Validator;
@@ -34,6 +41,9 @@ pub struct Kernel {
     /// The Constitution
     constitution: Constitution,
 
+    /// Loaded constitution source path
+    constitution_path: PathBuf,
+
     /// Authority kernel
     authority: AuthorityKernel,
 
@@ -46,14 +56,15 @@ pub struct Kernel {
 
 impl Kernel {
     /// Create a new kernel
-    pub fn new(workspace_root: PathBuf, vault: Arc<Vault>) -> Result<Self> {
-        let constitution = Constitution::new();
+    pub fn new(workspace_root: PathBuf, constitution_path: PathBuf, vault: Arc<Vault>) -> Result<Self> {
+        let constitution = Constitution::load_from_yaml(&constitution_path)?;
         let validator = Validator::new(constitution.clone());
         let authority = AuthorityKernel::default();
 
         Ok(Self {
             workspace_root,
             constitution,
+            constitution_path,
             authority,
             validator,
             vault,
@@ -68,6 +79,11 @@ impl Kernel {
     /// Get constitution
     pub fn constitution(&self) -> &Constitution {
         &self.constitution
+    }
+
+    /// Get constitution source path
+    pub fn constitution_path(&self) -> &PathBuf {
+        &self.constitution_path
     }
 
     /// Validate an operation

@@ -12,6 +12,7 @@ use crate::error::Result;
 pub enum LlmProvider {
     OpenAI,
     Anthropic,
+    LiteLlm,
     MiniMax,
     DeepSeek,
     GLM,
@@ -23,6 +24,7 @@ impl LlmProvider {
         match value.to_ascii_lowercase().as_str() {
             "openai" => Self::OpenAI,
             "anthropic" => Self::Anthropic,
+            "litellm" => Self::LiteLlm,
             "minimax" => Self::MiniMax,
             "deepseek" => Self::DeepSeek,
             "glm" => Self::GLM,
@@ -35,6 +37,7 @@ impl LlmProvider {
         match self {
             Self::OpenAI => "OPENAI_API_KEY",
             Self::Anthropic => "ANTHROPIC_API_KEY",
+            Self::LiteLlm => "ORA_API_KEY",
             Self::MiniMax => "MINIMAX_API_KEY",
             Self::DeepSeek => "DEEPSEEK_API_KEY",
             Self::GLM => "GLM_API_KEY",
@@ -46,6 +49,7 @@ impl LlmProvider {
         match self {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
+            Self::LiteLlm => "litellm",
             Self::MiniMax => "minimax",
             Self::DeepSeek => "deepseek",
             Self::GLM => "glm",
@@ -184,6 +188,23 @@ impl LlmClient {
                     })
                     .collect())
             }
+            LlmProvider::LiteLlm => {
+                let models = crate::llm::providers::openai::list_models(
+                    self.base_url.as_deref(),
+                    self.api_key.as_deref(),
+                )
+                .await?;
+                let selected = crate::llm::providers::openai::select_model(&models, &self.model);
+                Ok(models
+                    .into_iter()
+                    .map(|model| AvailableModel {
+                        id: model.id.clone(),
+                        name: model.name,
+                        provider: self.provider_name().to_string(),
+                        selected: selected.as_deref() == Some(model.id.as_str()),
+                    })
+                    .collect())
+            }
             _ => Ok(vec![self.fallback_model_info()]),
         }
     }
@@ -197,6 +218,14 @@ impl LlmClient {
             LlmProvider::Ollama => {
                 crate::llm::providers::local::resolve_model(self.base_url.as_deref(), &self.model)
                     .await
+            }
+            LlmProvider::LiteLlm => {
+                crate::llm::providers::openai::resolve_model(
+                    self.base_url.as_deref(),
+                    self.api_key.as_deref(),
+                    &self.model,
+                )
+                .await
             }
             _ => self.resolved_model(),
         }
@@ -231,6 +260,12 @@ impl LlmClient {
                 Box::new(crate::llm::providers::openai::OpenAiCompatibleProvider {
                     default_base_url: "https://api.openai.com/v1".to_string(),
                     provider_name: "openai".to_string(),
+                })
+            }
+            LlmProvider::LiteLlm => {
+                Box::new(crate::llm::providers::openai::OpenAiCompatibleProvider {
+                    default_base_url: "http://127.0.0.1:4000".to_string(),
+                    provider_name: "litellm".to_string(),
                 })
             }
             LlmProvider::DeepSeek => {

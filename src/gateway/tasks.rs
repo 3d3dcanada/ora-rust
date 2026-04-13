@@ -1,6 +1,7 @@
 //! Shared task execution utilities for HTTP and WebSocket gateways.
 
 use crate::error::OraError;
+use crate::runtime::{handle_runtime_query, RuntimeOutcome};
 use crate::state::{AgentEvent, AppState, TaskStatus};
 
 /// Result returned to gateway callers after prompt execution finishes.
@@ -57,7 +58,7 @@ pub fn spawn_prompt_task(
         }
 
         match generate_chat_response(&state_for_task, &command_for_task).await {
-            Ok(output) => {
+            Ok((output, requires_approval)) => {
                 state_for_task.finish_task(
                     &task_id_for_task,
                     TaskStatus::Completed,
@@ -73,7 +74,7 @@ pub fn spawn_prompt_task(
                     task_id: task_id_for_task,
                     response: output,
                     success: true,
-                    requires_approval: false,
+                    requires_approval,
                 }
             }
             Err(error) => {
@@ -102,20 +103,29 @@ pub fn spawn_prompt_task(
     handle
 }
 
-fn ora_system_prompt() -> &'static str {
-    r#"You are OrA, an AI assistant with a security-first mindset.
-You help users with tasks while being aware of security implications.
-Be concise and helpful. If a request seems dangerous, warn the user."#
-}
-
-async fn generate_chat_response(state: &AppState, command: &str) -> Result<String, OraError> {
-    if !state.llm.is_configured() {
-        return Err(OraError::CredentialNotFound {
-            provider: state.config.llm_provider.clone(),
-        });
+async fn generate_chat_response(
+    state: &AppState,
+    command: &str,
+) -> Result<(String, bool), OraError> {
+    match handle_runtime_query(state, command).await? {
+        RuntimeOutcome::VerifiedAnswer(result) => Ok((
+            format!(
+                "{}\n\nRoute: {:?}\nEvidence bundle: {}",
+                result.response, result.route_decision.selected_route, result.evidence_bundle_id
+            ),
+            false,
+        )),
+        RuntimeOutcome::BrowserTask(result) => Ok((
+            match result.approval_id.clone() {
+                Some(approval_id) => format!(
+                "{}\nTask id: {}\nApproval id: {}",
+                result.message, result.task.id, approval_id
+            ),
+                None => format!("{}\nTask id: {}", result.message, result.task.id),
+            },
+            result.approval_id.is_some(),
+        )),
     }
-
-    state.llm.chat(ora_system_prompt(), command).await
 }
 
 fn map_chat_error(error: OraError) -> String {

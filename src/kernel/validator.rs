@@ -3,6 +3,7 @@
 //! Validates operations against the Constitution before execution.
 
 use crate::kernel::constitution::Constitution;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// Operation validator - checks operations against the Constitution
@@ -21,6 +22,7 @@ impl Validator {
     pub fn validate(&self, operation: &str, details: &str) -> ValidationResult {
         let mut violations = Vec::new();
         let mut warnings = Vec::new();
+        let combined = format!("{operation}\n{details}");
 
         // Check prime directive
         if let Some(violation) = self.constitution.check_prime_directive(operation, details) {
@@ -41,6 +43,33 @@ impl Validator {
                 ),
                 severity: Severity::Error,
             });
+        }
+
+        for rule in &self.constitution.custom_rules {
+            let Ok(pattern) = Regex::new(&rule.pattern) else {
+                continue;
+            };
+
+            if pattern.is_match(&combined) {
+                let violation = ValidationViolation {
+                    violation_type: ViolationType::Policy,
+                    message: format!(
+                        "Policy rule '{}' matched '{}'",
+                        rule.name, rule.description
+                    ),
+                    severity: if rule.action == "block" {
+                        Severity::Error
+                    } else {
+                        Severity::Warning
+                    },
+                };
+
+                if rule.action == "block" {
+                    violations.push(violation);
+                } else {
+                    warnings.push(violation);
+                }
+            }
         }
 
         // Check for suspicious patterns (warnings)
@@ -139,6 +168,7 @@ pub struct ValidationViolation {
 pub enum ViolationType {
     PrimeDirective,
     Prohibited,
+    Policy,
     Authority,
     Suspicious,
 }
@@ -176,6 +206,27 @@ mod tests {
             .violations
             .iter()
             .any(|v| v.violation_type == ViolationType::Prohibited));
+    }
+
+    #[test]
+    fn test_policy_rule_match() {
+        let constitution = Constitution::load_from_yaml(std::path::Path::new(
+            "/home/wess/ora/config/odin-constitution.yaml",
+        ))
+        .expect("constitution should load");
+        let validator = Validator::new(constitution);
+
+        let result = validator.validate("integrate", "add Auth0 as the required auth layer");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|v| v.violation_type == ViolationType::Policy)
+                || result
+                    .violations
+                    .iter()
+                    .any(|v| v.violation_type == ViolationType::Policy)
+        );
     }
 
     #[test]

@@ -1,8 +1,7 @@
 //! OrA - Omni-Recursive Agent
 
 use clap::{Args, Parser, Subcommand};
-use ora_rust::{gateway::create_router, AppState, Config};
-use std::net::SocketAddr;
+use ora_rust::{gateway::create_router, kernel::ControlPlane, AppState, Config};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -64,15 +63,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let port = config.port;
     let host = config.host.clone();
-    println!("OrA v{} - starting", env!("CARGO_PKG_VERSION"));
+    eprintln!("OrA v{} - starting", env!("CARGO_PKG_VERSION"));
 
     let vault = ora_rust::security::vault::Vault::new(config.vault_path.clone());
     let security_gates = ora_rust::security::gates::AstParser::new(true);
     let audit_logger = ora_rust::audit::logger::AuditLogger::new(config.audit_path.clone())?;
+    let control_plane = Arc::new(ControlPlane::new(
+        config.control_plane_db_path.clone(),
+        config.artifacts_root.clone(),
+        config.qdrant_url.clone(),
+        config.qdrant_collection.clone(),
+    )?);
 
     let vault2 = vault.clone();
     let kernel = Arc::new(RwLock::new(ora_rust::kernel::Kernel::new(
         config.workspace_root.clone(),
+        config.constitution_path.clone(),
         Arc::new(vault2),
     )?));
 
@@ -82,20 +88,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vault,
         Arc::new(security_gates),
         Arc::new(RwLock::new(audit_logger)),
+        control_plane,
     );
 
     match mode {
         RunMode::Mcp => {
-            println!("Starting MCP stdio mode");
+            eprintln!("Starting MCP stdio mode");
             let mcp_server = ora_rust::gateway::mcp::McpServer::new(state);
             mcp_server.run_stdio().await?;
         }
         RunMode::Serve => {
             let app = create_router(config, state);
-            let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            println!("Listening on http://{}:{}", host, port);
+            eprintln!("Listening on http://{}:{}", host, port);
 
-            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
             axum::serve(listener, app).await?;
         }
     }

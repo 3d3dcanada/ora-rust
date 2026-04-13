@@ -7,6 +7,7 @@ pub mod gateway;
 pub mod kernel;
 pub mod llm;
 pub mod orchestration;
+pub mod runtime;
 pub mod security;
 pub mod state;
 

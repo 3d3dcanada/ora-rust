@@ -43,7 +43,7 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(state: AppState) -> Self {
-        let tools = Arc::new(ToolExecutor::new(state.config.workspace_root.clone()));
+        let tools = Arc::new(ToolExecutor::new(state.clone()));
         Self { state, tools }
     }
 
@@ -86,6 +86,11 @@ impl McpServer {
         }
 
         Ok(())
+    }
+
+    /// Handle a single MCP JSON-RPC request, useful for HTTP transport.
+    pub async fn handle_jsonrpc(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        self.handle_request(&req).await
     }
 
     async fn handle_request(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
@@ -139,36 +144,101 @@ impl McpServer {
     }
 
     async fn handle_tools_list(&self) -> std::result::Result<serde_json::Value, JsonRpcError> {
-        // Expose available tools
         let tools = vec![
             serde_json::json!({
-                "name": "read_file",
-                "description": "Reads a file securely (A1+ clearance required).",
+                "name": "verified_answer",
+                "description": "Answers a question with route tracing, evidence persistence, and grounded citations.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
                 }
             }),
             serde_json::json!({
-                "name": "execute_command",
-                "description": "Executes a shell command securely (A2+ clearance required).",
+                "name": "grounded_summarize",
+                "description": "Summarizes provided content and stores the summary as a grounded evidence bundle.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "command": { "type": "string" } },
-                    "required": ["command"]
+                    "properties": {
+                        "title": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"]
                 }
             }),
             serde_json::json!({
-                "name": "web_search",
-                "description": "Searches the web through the configured provider.",
+                "name": "memory_search",
+                "description": "Searches durable ORA memory records with provenance and confidence.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string" },
-                        "num_results": { "type": "integer", "default": 5 }
+                        "limit": { "type": "integer", "default": 5 }
                     },
                     "required": ["query"]
+                }
+            }),
+            serde_json::json!({
+                "name": "safe_browser_task",
+                "description": "Registers a governed browser task and creates approvals for sensitive actions.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string" },
+                        "url": { "type": "string" },
+                        "allowed_domains": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["task"]
+                }
+            }),
+            serde_json::json!({
+                "name": "approval_queue",
+                "description": "Lists pending ORA approval requests.",
+                "inputSchema": { "type": "object", "properties": {} }
+            }),
+            serde_json::json!({
+                "name": "evidence_bundle",
+                "description": "Retrieves a stored evidence bundle by id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "bundle_id": { "type": "string" }
+                    },
+                    "required": ["bundle_id"]
+                }
+            }),
+            serde_json::json!({
+                "name": "create_mission",
+                "description": "Creates a repeatable research mission with sources, extraction rules, and freshness policy.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "query": { "type": "string" },
+                        "sources": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "extraction_rules": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "freshness_policy": { "type": "string" }
+                    },
+                    "required": ["name", "query"]
+                }
+            }),
+            serde_json::json!({
+                "name": "list_missions",
+                "description": "Lists stored ORA research missions.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "integer", "default": 10 }
+                    }
                 }
             }),
         ];
@@ -213,6 +283,9 @@ impl McpServer {
                         "text": result.output
                     }
                 ],
+                "metadata": result.metadata,
+                "approvalId": result.approval_id,
+                "requiresApproval": result.requires_approval,
                 "isError": false
             }))
         } else {
@@ -223,6 +296,9 @@ impl McpServer {
                         "text": result.error.unwrap_or_else(|| "Unknown error".to_string())
                     }
                 ],
+                "metadata": result.metadata,
+                "approvalId": result.approval_id,
+                "requiresApproval": result.requires_approval,
                 "isError": true
             }))
         }

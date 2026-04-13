@@ -5,7 +5,7 @@
 
 use crate::error::{OraError, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Main configuration for OrA
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,7 +13,7 @@ pub struct Config {
     // =========================================================================
     // Server Configuration
     // =========================================================================
-    /// Server host (default: 0.0.0.0)
+    /// Server host (default: 127.0.0.1)
     pub host: String,
 
     /// HTTP server port (default: 8001)
@@ -25,16 +25,25 @@ pub struct Config {
     // =========================================================================
     // Paths
     // =========================================================================
-    /// Workspace root directory (default: ~/.ora-workspace)
+    /// Workspace root directory
     pub workspace_root: PathBuf,
 
-    /// Vault file path (default: ~/.ora/vault.enc)
+    /// Vault file path
     pub vault_path: PathBuf,
 
-    /// Audit log path (default: ~/.ora/audit.log)
+    /// Audit log path
     pub audit_path: PathBuf,
 
-    /// Config file path (default: ~/.ora/config.toml)
+    /// Control-plane SQLite path
+    pub control_plane_db_path: PathBuf,
+
+    /// Artifact storage root
+    pub artifacts_root: PathBuf,
+
+    /// Constitution YAML path
+    pub constitution_path: PathBuf,
+
+    /// Config file path
     pub config_path: Option<PathBuf>,
 
     // =========================================================================
@@ -43,7 +52,7 @@ pub struct Config {
     /// Default LLM provider (openai, anthropic, minimax, etc.)
     pub llm_provider: String,
 
-    /// Default model name (claude-opus-4-6, minimax-m2.5, etc.)
+    /// Default model name
     pub default_model: String,
 
     /// Alias for default_model (used by state.rs)
@@ -68,6 +77,15 @@ pub struct Config {
     pub temperature: f32,
 
     // =========================================================================
+    // Memory / Vector Configuration
+    // =========================================================================
+    /// Optional Qdrant endpoint for vector-backed memory search
+    pub qdrant_url: Option<String>,
+
+    /// Qdrant collection name
+    pub qdrant_collection: String,
+
+    // =========================================================================
     // Security Configuration
     // =========================================================================
     /// Maximum authority level without escalation (0-5)
@@ -89,6 +107,15 @@ pub struct Config {
     pub constitution_enabled: bool,
 
     // =========================================================================
+    // Browser Configuration
+    // =========================================================================
+    /// Enable browser mission support
+    pub browser_enabled: bool,
+
+    /// Optional command for an external local browser harness
+    pub browser_command: Option<String>,
+
+    // =========================================================================
     // User Configuration
     // =========================================================================
     /// Default user name
@@ -107,18 +134,22 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let ora_home = home.join(".ora");
 
         Self {
             // Server
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 8001,
             ws_port: 8001,
 
             // Paths
             workspace_root: home.join("ora-workspace"),
-            vault_path: home.join(".ora").join("vault.enc"),
-            audit_path: home.join(".ora").join("audit.log"),
-            config_path: Some(home.join(".ora").join("config.toml")),
+            vault_path: ora_home.join("vault.enc"),
+            audit_path: ora_home.join("audit.log"),
+            control_plane_db_path: ora_home.join("state").join("control_plane.sqlite"),
+            artifacts_root: ora_home.join("artifacts"),
+            constitution_path: default_constitution_path(&home),
+            config_path: Some(ora_home.join("config.toml")),
 
             // LLM
             llm_provider: "ollama".to_string(),
@@ -130,14 +161,22 @@ impl Default for Config {
             max_tokens: 1024,
             temperature: 0.7,
 
+            // Memory / vector
+            qdrant_url: None,
+            qdrant_collection: "ora_memory".to_string(),
+
             // Security
-            max_authority_level: 3, // A3 by default
+            max_authority_level: 3,
             session_timeout: 3600,
             security_gates_enabled: true,
 
             // Constitution
             constitution_version: "1.0.0".to_string(),
             constitution_enabled: true,
+
+            // Browser
+            browser_enabled: true,
+            browser_command: None,
 
             // User
             user_name: "User".to_string(),
@@ -150,11 +189,10 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load configuration from file and environment
+    /// Load configuration from file and environment.
     pub fn load() -> Result<Self> {
         let mut config = Self::default();
 
-        // Try to load from config file
         if let Some(ref path) = config.config_path {
             if path.exists() {
                 let contents =
@@ -173,16 +211,13 @@ impl Config {
             }
         }
 
-        // Override with environment variables
         config.apply_env_vars();
-
-        // Ensure directories exist
         config.ensure_directories()?;
 
         Ok(config)
     }
 
-    /// Load from a specific config file path
+    /// Load from a specific config file path.
     pub fn load_from(path: &PathBuf) -> Result<Self> {
         let mut config = Self::default();
 
@@ -198,12 +233,25 @@ impl Config {
         Ok(config)
     }
 
-    /// Apply configuration from file
+    /// Apply configuration from file.
     fn apply_file_config(&mut self, config: FileConfig) {
         if let Some(server) = config.server {
             self.host = server.host.unwrap_or(self.host.clone());
             self.port = server.port.unwrap_or(self.port);
             self.ws_port = server.ws_port.unwrap_or(self.ws_port);
+        }
+
+        if let Some(paths) = config.paths {
+            self.workspace_root = paths.workspace_root.unwrap_or(self.workspace_root.clone());
+            self.vault_path = paths.vault_path.unwrap_or(self.vault_path.clone());
+            self.audit_path = paths.audit_path.unwrap_or(self.audit_path.clone());
+            self.control_plane_db_path = paths
+                .control_plane_db_path
+                .unwrap_or(self.control_plane_db_path.clone());
+            self.artifacts_root = paths.artifacts_root.unwrap_or(self.artifacts_root.clone());
+            self.constitution_path = paths
+                .constitution_path
+                .unwrap_or(self.constitution_path.clone());
         }
 
         if let Some(llm) = config.llm {
@@ -217,6 +265,13 @@ impl Config {
             self.temperature = llm.temperature.unwrap_or(self.temperature);
         }
 
+        if let Some(control_plane) = config.control_plane {
+            self.qdrant_url = control_plane.qdrant_url.or(self.qdrant_url.clone());
+            self.qdrant_collection = control_plane
+                .qdrant_collection
+                .unwrap_or(self.qdrant_collection.clone());
+        }
+
         if let Some(security) = config.security {
             self.max_authority_level = security
                 .max_authority_level
@@ -225,6 +280,21 @@ impl Config {
             self.security_gates_enabled = security
                 .security_gates_enabled
                 .unwrap_or(self.security_gates_enabled);
+        }
+
+        if let Some(constitution) = config.constitution {
+            self.constitution_version = constitution
+                .version
+                .unwrap_or(self.constitution_version.clone());
+            self.constitution_enabled = constitution
+                .enabled
+                .unwrap_or(self.constitution_enabled);
+            self.constitution_path = constitution.path.unwrap_or(self.constitution_path.clone());
+        }
+
+        if let Some(browser) = config.browser {
+            self.browser_enabled = browser.enabled.unwrap_or(self.browser_enabled);
+            self.browser_command = browser.command.or(self.browser_command.clone());
         }
 
         if let Some(user) = config.user {
@@ -236,7 +306,7 @@ impl Config {
         }
     }
 
-    /// Apply environment variable overrides
+    /// Apply environment variable overrides.
     fn apply_env_vars(&mut self) {
         // Server
         if let Ok(host) = std::env::var("ORA_HOST") {
@@ -248,6 +318,26 @@ impl Config {
             }
         }
 
+        // Paths
+        if let Ok(path) = std::env::var("ORA_WORKSPACE_ROOT") {
+            self.workspace_root = PathBuf::from(path);
+        }
+        if let Ok(path) = std::env::var("ORA_VAULT_PATH") {
+            self.vault_path = PathBuf::from(path);
+        }
+        if let Ok(path) = std::env::var("ORA_AUDIT_PATH") {
+            self.audit_path = PathBuf::from(path);
+        }
+        if let Ok(path) = std::env::var("ORA_CONTROL_PLANE_DB_PATH") {
+            self.control_plane_db_path = PathBuf::from(path);
+        }
+        if let Ok(path) = std::env::var("ORA_ARTIFACTS_ROOT") {
+            self.artifacts_root = PathBuf::from(path);
+        }
+        if let Ok(path) = std::env::var("ORA_CONSTITUTION_PATH") {
+            self.constitution_path = PathBuf::from(path);
+        }
+
         // LLM
         if let Ok(provider) = std::env::var("ORA_LLM_PROVIDER") {
             self.llm_provider = provider;
@@ -256,8 +346,11 @@ impl Config {
             self.default_model = model;
         }
         if let Ok(api_key) = std::env::var("ORA_API_KEY") {
-            // API key goes to vault, not config
+            self.llm_api_key = Some(api_key.clone());
             std::env::set_var("ORA_API_KEY", api_key);
+        }
+        if let Ok(api_key) = std::env::var("ORA_LLM_API_KEY") {
+            self.llm_api_key = Some(api_key);
         }
         if let Ok(base_url) = std::env::var("ORA_API_BASE_URL") {
             self.api_base_url = Some(base_url.clone());
@@ -267,11 +360,35 @@ impl Config {
             self.llm_base_url = Some(base_url);
         }
 
+        // Memory / vector
+        if let Ok(url) = std::env::var("ORA_QDRANT_URL") {
+            self.qdrant_url = Some(url);
+        }
+        if let Ok(collection) = std::env::var("ORA_QDRANT_COLLECTION") {
+            self.qdrant_collection = collection;
+        }
+
         // Security
         if let Ok(level) = std::env::var("ORA_MAX_AUTHORITY") {
             if let Ok(l) = level.parse() {
                 self.max_authority_level = l;
             }
+        }
+
+        // Constitution
+        if let Ok(version) = std::env::var("ORA_CONSTITUTION_VERSION") {
+            self.constitution_version = version;
+        }
+        if let Ok(enabled) = std::env::var("ORA_CONSTITUTION_ENABLED") {
+            self.constitution_enabled = enabled.to_lowercase() == "true";
+        }
+
+        // Browser
+        if let Ok(enabled) = std::env::var("ORA_BROWSER_ENABLED") {
+            self.browser_enabled = enabled.to_lowercase() == "true";
+        }
+        if let Ok(command) = std::env::var("ORA_BROWSER_COMMAND") {
+            self.browser_command = Some(command);
         }
 
         // Debug
@@ -280,20 +397,25 @@ impl Config {
         }
     }
 
-    /// Ensure required directories exist
+    /// Ensure required directories exist.
     fn ensure_directories(&self) -> Result<()> {
-        // Ensure .ora directory exists
-        if let Some(parent) = self.vault_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        for path in [
+            self.vault_path.parent(),
+            self.audit_path.parent(),
+            self.control_plane_db_path.parent(),
+            Some(self.artifacts_root.as_path()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            std::fs::create_dir_all(path)?;
         }
 
-        // Ensure workspace directory exists
         std::fs::create_dir_all(&self.workspace_root)?;
-
         Ok(())
     }
 
-    /// Get the API base URL for the configured provider
+    /// Get the API base URL for the configured provider.
     pub fn get_api_base_url(&self) -> String {
         if let Some(ref url) = self.api_base_url {
             return url.clone();
@@ -320,9 +442,17 @@ struct FileConfig {
     #[serde(default)]
     server: Option<ServerConfig>,
     #[serde(default)]
+    paths: Option<PathsConfig>,
+    #[serde(default)]
     llm: Option<LlmConfig>,
     #[serde(default)]
+    control_plane: Option<ControlPlaneConfig>,
+    #[serde(default)]
     security: Option<SecurityConfig>,
+    #[serde(default)]
+    constitution: Option<ConstitutionConfig>,
+    #[serde(default)]
+    browser: Option<BrowserConfig>,
     #[serde(default)]
     user: Option<UserConfig>,
     #[serde(default)]
@@ -340,6 +470,22 @@ struct ServerConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct PathsConfig {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    vault_path: Option<PathBuf>,
+    #[serde(default)]
+    audit_path: Option<PathBuf>,
+    #[serde(default)]
+    control_plane_db_path: Option<PathBuf>,
+    #[serde(default)]
+    artifacts_root: Option<PathBuf>,
+    #[serde(default)]
+    constitution_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
 struct LlmConfig {
     #[serde(default)]
     provider: Option<String>,
@@ -354,6 +500,14 @@ struct LlmConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct ControlPlaneConfig {
+    #[serde(default)]
+    qdrant_url: Option<String>,
+    #[serde(default)]
+    qdrant_collection: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SecurityConfig {
     #[serde(default)]
     max_authority_level: Option<u8>,
@@ -364,9 +518,41 @@ struct SecurityConfig {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConstitutionConfig {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserConfig {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct UserConfig {
     #[serde(default)]
     name: Option<String>,
+}
+
+fn default_constitution_path(home: &Path) -> PathBuf {
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| home.to_path_buf());
+    let candidates = [
+        current_dir.join("config").join("odin-constitution.yaml"),
+        current_dir.join("../config").join("odin-constitution.yaml"),
+        home.join(".ora").join("odin-constitution.yaml"),
+    ];
+
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| home.join(".ora").join("odin-constitution.yaml"))
 }
 
 // =========================================================================

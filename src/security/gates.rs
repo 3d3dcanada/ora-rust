@@ -175,6 +175,11 @@ mod tests {
     fn test_latency_is_under_2ms() {
         let parser = AstParser::new(true);
         let large_prompt = "Hello ".repeat(1000);
+        let threshold_us = if cfg!(debug_assertions) {
+            10_000
+        } else {
+            2_000
+        };
 
         // Warm the hot path so the benchmark reflects steady-state parsing cost.
         let warmup = parser.parse_prompt(&large_prompt);
@@ -190,9 +195,10 @@ mod tests {
 
         let average_latency = total_latency / samples;
         assert!(
-            average_latency < 2000,
-            "Average latency was {} us, expected < 2000",
-            average_latency
+            average_latency < threshold_us,
+            "Average latency was {} us, expected < {}",
+            average_latency,
+            threshold_us
         );
     }
 }

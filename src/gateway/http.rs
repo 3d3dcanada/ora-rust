@@ -3,7 +3,7 @@
 //! REST API routes for OrA.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -11,7 +11,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::gateway::mcp::{JsonRpcRequest, JsonRpcResponse, McpServer};
 use crate::gateway::tasks::spawn_prompt_task;
+use crate::runtime::{create_browser_task, create_mission, BrowserTaskRequest};
 use crate::AppState;
 
 #[derive(Debug, Serialize)]
@@ -128,6 +130,28 @@ pub struct ProcessRequest {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MemorySearchParams {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MissionCreateRequest {
+    pub name: String,
+    pub query: String,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub extraction_rules: Vec<String>,
+    pub freshness_policy: Option<String>,
+}
+
 pub fn create_router(config: Config, state: AppState) -> Router {
     Router::new()
         .route("/", get(root))
@@ -143,9 +167,22 @@ pub fn create_router(config: Config, state: AppState) -> Router {
         .route("/approvals", get(approvals_list))
         .route("/approvals/:id/approve", post(approval_approve))
         .route("/approvals/:id/reject", post(approval_reject))
+        .route("/operator/routes", get(operator_routes))
+        .route("/operator/evidence/:bundle_id", get(operator_evidence_bundle))
+        .route("/operator/memory/search", get(operator_memory_search))
+        .route(
+            "/operator/missions",
+            get(operator_list_missions).post(operator_create_mission),
+        )
+        .route(
+            "/operator/browser-tasks",
+            get(operator_list_browser_tasks).post(operator_create_browser_task),
+        )
+        .route("/operator/audit", get(operator_audit_feed))
         .route("/kernel/metrics", get(kernel_metrics))
         .route("/kernel/process", post(kernel_process))
         .route("/chat", post(chat_handler))
+        .route("/mcp", post(mcp_http_handler))
         .route("/ws", get(super::websocket::websocket_handler))
         .with_state((config, state))
 }
@@ -205,13 +242,32 @@ async fn vault_status(State((_, state)): State<(Config, AppState)>) -> Json<Vaul
 async fn vault_unlock(
     State((_, state)): State<(Config, AppState)>,
     Json(req): Json<VaultUnlockRequest>,
-) -> Json<VaultUnlockResponse> {
+) -> (StatusCode, Json<VaultUnlockResponse>) {
     let mut vault = state.vault.write().await;
-    let _ = vault.unlock(Some(&req.password));
-    Json(VaultUnlockResponse {
-        success: true,
-        message: "Vault unlocked".to_string(),
-    })
+
+    match vault.unlock(Some(&req.password)) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(VaultUnlockResponse {
+                success: true,
+                message: "Vault unlocked".to_string(),
+            }),
+        ),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(VaultUnlockResponse {
+                success: false,
+                message: "Vault was not unlocked".to_string(),
+            }),
+        ),
+        Err(error) => (
+            StatusCode::UNAUTHORIZED,
+            Json(VaultUnlockResponse {
+                success: false,
+                message: format!("Vault unlock failed: {}", error.user_message()),
+            }),
+        ),
+    }
 }
 
 async fn vault_lock(State((_, state)): State<(Config, AppState)>) -> Json<serde_json::Value> {
@@ -313,11 +369,8 @@ async fn approval_approve(
     State((_, state)): State<(Config, AppState)>,
     Json(req): Json<ApprovalActionRequest>,
 ) -> (StatusCode, Json<ApprovalActionResponse>) {
-    let known = state
-        .pending_approvals()
-        .into_iter()
-        .any(|approval| approval.id == id);
-    if !known {
+    let updated = state.resolve_approval(&id, true, req.approver.clone(), req.reason.clone());
+    if updated.is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(ApprovalActionResponse {
@@ -348,11 +401,8 @@ async fn approval_reject(
     State((_, state)): State<(Config, AppState)>,
     Json(req): Json<ApprovalActionRequest>,
 ) -> (StatusCode, Json<ApprovalActionResponse>) {
-    let known = state
-        .pending_approvals()
-        .into_iter()
-        .any(|approval| approval.id == id);
-    if !known {
+    let updated = state.resolve_approval(&id, false, req.approver.clone(), req.reason.clone());
+    if updated.is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(ApprovalActionResponse {
@@ -376,6 +426,103 @@ async fn approval_reject(
             message: format!("Approval {} rejected", id),
         }),
     )
+}
+
+async fn operator_routes(
+    State((_, state)): State<(Config, AppState)>,
+    Query(params): Query<ListParams>,
+) -> Json<serde_json::Value> {
+    let limit = params.limit.unwrap_or(20);
+    Json(serde_json::json!({
+        "routes": state.recent_route_decisions(limit)
+    }))
+}
+
+async fn operator_evidence_bundle(
+    Path(bundle_id): Path<String>,
+    State((_, state)): State<(Config, AppState)>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "bundle_id": bundle_id,
+        "evidence": state.evidence_bundle(&bundle_id),
+    }))
+}
+
+async fn operator_memory_search(
+    State((_, state)): State<(Config, AppState)>,
+    Query(params): Query<MemorySearchParams>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "query": params.q,
+        "results": state.search_memory(&params.q, params.limit.unwrap_or(10)),
+    }))
+}
+
+async fn operator_list_missions(
+    State((_, state)): State<(Config, AppState)>,
+    Query(params): Query<ListParams>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "missions": state.list_missions(params.limit.unwrap_or(20)),
+    }))
+}
+
+async fn operator_create_mission(
+    State((_, state)): State<(Config, AppState)>,
+    Json(req): Json<MissionCreateRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match create_mission(
+        &state,
+        &req.name,
+        &req.query,
+        req.sources,
+        req.extraction_rules,
+        req.freshness_policy.as_deref().unwrap_or("recent"),
+    ) {
+        Ok(mission) => (StatusCode::CREATED, Json(serde_json::json!({ "mission": mission }))),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+async fn operator_list_browser_tasks(
+    State((_, state)): State<(Config, AppState)>,
+    Query(params): Query<ListParams>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "browser_tasks": state.list_browser_tasks(params.limit.unwrap_or(20)),
+    }))
+}
+
+async fn operator_create_browser_task(
+    State((_, state)): State<(Config, AppState)>,
+    Json(req): Json<BrowserTaskRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match create_browser_task(&state, req) {
+        Ok(result) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "message": result.message,
+                "task": result.task,
+                "approval_id": result.approval_id,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
+async fn operator_audit_feed(
+    State((_, state)): State<(Config, AppState)>,
+    Query(params): Query<ListParams>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "events": state.recent_audit_events(params.limit.unwrap_or(50)),
+    }))
 }
 
 async fn kernel_metrics() -> Json<MetricsResponse> {
@@ -436,6 +583,14 @@ async fn chat_handler(
         }),
     )
     .await
+}
+
+async fn mcp_http_handler(
+    State((_, state)): State<(Config, AppState)>,
+    Json(req): Json<JsonRpcRequest>,
+) -> Json<JsonRpcResponse> {
+    let server = McpServer::new(state);
+    Json(server.handle_jsonrpc(req).await)
 }
 
 fn current_cpu_usage() -> f64 {

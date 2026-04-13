@@ -2,7 +2,10 @@
 
 use crate::audit::logger::AuditLogger;
 use crate::config::Config;
-use crate::kernel::Kernel;
+use crate::kernel::{
+    ApprovalRequest, ApprovalState, AuditEvent, BrowserTask, EvidenceItem, Kernel, MemoryRecord,
+    MissionSpec, RouteDecision, SharedControlPlane,
+};
 use crate::llm::LlmClient;
 use crate::security::gates::AstParser;
 use crate::security::vault::Vault;
@@ -150,6 +153,7 @@ pub struct AppState {
     pub vault: Arc<RwLock<Vault>>,
     pub security_gates: Arc<AstParser>,
     pub audit_logger: Arc<RwLock<AuditLogger>>,
+    pub control_plane: SharedControlPlane,
     /// Broadcast channel for real-time events
     pub event_tx: broadcast::Sender<AgentEvent>,
     /// LLM client (shared)
@@ -165,6 +169,7 @@ impl AppState {
         vault: Vault,
         security_gates: Arc<AstParser>,
         audit_logger: Arc<RwLock<AuditLogger>>,
+        control_plane: SharedControlPlane,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(1000);
 
@@ -198,6 +203,7 @@ impl AppState {
             vault: Arc::new(RwLock::new(vault)),
             security_gates,
             audit_logger,
+            control_plane,
             event_tx,
             llm,
             tasks: Arc::new(ParkingRwLock::new(HashMap::new())),
@@ -308,11 +314,11 @@ impl AppState {
     /// Return all pending approvals in creation order.
     pub fn pending_approvals(&self) -> Vec<ApprovalRecord> {
         let mut approvals = self
-            .approvals
-            .read()
-            .values()
-            .filter(|approval| approval.status == ApprovalStatus::Pending)
-            .cloned()
+            .control_plane
+            .pending_approval_requests()
+            .unwrap_or_default()
+            .into_iter()
+            .map(approval_record_from_request)
             .collect::<Vec<_>>();
 
         approvals.sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -327,6 +333,23 @@ impl AppState {
         approver: Option<String>,
         reason: Option<String>,
     ) -> Option<ApprovalRecord> {
+        if let Ok(Some(request)) = self.control_plane.resolve_approval(
+            approval_id,
+            if approved {
+                ApprovalState::Approved
+            } else {
+                ApprovalState::Rejected
+            },
+            approver.clone(),
+            reason.clone(),
+        ) {
+            let updated = approval_record_from_request(request);
+            self.approvals
+                .write()
+                .insert(updated.id.clone(), updated.clone());
+            return Some(updated);
+        }
+
         let mut approvals = self.approvals.write();
         let approval = approvals.get_mut(approval_id)?;
         approval.status = if approved {
@@ -338,6 +361,62 @@ impl AppState {
         approval.reason = reason;
         approval.resolved_at = Some(Utc::now().to_rfc3339());
         Some(approval.clone())
+    }
+
+    /// Persist and broadcast a new approval request.
+    pub fn queue_approval_request(&self, approval: ApprovalRequest) {
+        let _ = self.control_plane.save_approval_request(&approval);
+        let approval_record = approval_record_from_request(approval.clone());
+        self.record_approval(approval_record.clone());
+        self.broadcast(AgentEvent::ApprovalRequired {
+            approval_id: approval_record.id,
+            agent: "ora".to_string(),
+            operation: approval_record.operation,
+            description: approval_record.description,
+            authority_required: approval_record.authority_required,
+            query: approval_record.query,
+        });
+    }
+
+    /// Persist and broadcast an audit event.
+    pub fn record_audit_event(&self, event: AuditEvent) {
+        let _ = self.control_plane.save_audit_event(&event);
+    }
+
+    /// Fetch recent route decisions.
+    pub fn recent_route_decisions(&self, limit: usize) -> Vec<RouteDecision> {
+        self.control_plane
+            .recent_route_decisions(limit)
+            .unwrap_or_default()
+    }
+
+    /// Fetch an evidence bundle by id.
+    pub fn evidence_bundle(&self, bundle_id: &str) -> Vec<EvidenceItem> {
+        self.control_plane.evidence_bundle(bundle_id).unwrap_or_default()
+    }
+
+    /// Search memory records.
+    pub fn search_memory(&self, query: &str, limit: usize) -> Vec<MemoryRecord> {
+        self.control_plane
+            .search_memory(query, limit)
+            .unwrap_or_default()
+    }
+
+    /// List missions from the control plane.
+    pub fn list_missions(&self, limit: usize) -> Vec<MissionSpec> {
+        self.control_plane.list_missions(limit).unwrap_or_default()
+    }
+
+    /// List browser tasks from the control plane.
+    pub fn list_browser_tasks(&self, limit: usize) -> Vec<BrowserTask> {
+        self.control_plane.list_browser_tasks(limit).unwrap_or_default()
+    }
+
+    /// List recent audit events.
+    pub fn recent_audit_events(&self, limit: usize) -> Vec<AuditEvent> {
+        self.control_plane
+            .recent_audit_events(limit)
+            .unwrap_or_default()
     }
 
     /// Broadcast an event and keep approval state in sync.
@@ -374,5 +453,25 @@ impl AppState {
 
         // Ignore send errors (no subscribers)
         let _ = self.event_tx.send(event);
+    }
+}
+
+fn approval_record_from_request(request: ApprovalRequest) -> ApprovalRecord {
+    ApprovalRecord {
+        id: request.id,
+        agent: "ora".to_string(),
+        operation: request.operation,
+        description: request.description,
+        authority_required: request.authority_required,
+        query: serde_json::to_string(&request.request_payload).unwrap_or_default(),
+        created_at: request.created_at,
+        status: match request.status {
+            ApprovalState::Pending => ApprovalStatus::Pending,
+            ApprovalState::Approved => ApprovalStatus::Approved,
+            ApprovalState::Rejected => ApprovalStatus::Rejected,
+        },
+        approver: request.approver,
+        reason: request.resolution_reason,
+        resolved_at: request.resolved_at,
     }
 }
